@@ -1,8 +1,9 @@
-use std::num::ParseIntError;
 use std::sync::mpsc::{Sender, Receiver};
 use rustyline::error::ReadlineError;
-use rustyline::{DefaultEditor};
+use rustyline::DefaultEditor;
 use ez80::*;
+
+mod parser;
 
 use agon_cpu_emulator::{ DebugResp, DebugCmd };
 
@@ -22,6 +23,7 @@ fn print_help() {
     println!("exit                         Quit from Agon Light Emulator");
     println!("info breakpoints             List breakpoints");
     println!("[mem]ory <start> [len]       Dump memory");
+    println!("n[ext]                       Step over function calls");
     println!("state                        Show CPU state");
     println!(".                            Show CPU state");
     println!("s[tep]                       Execute one instuction");
@@ -29,120 +31,24 @@ fn print_help() {
     println!("The previous command can be repeated by pressing return.");
 }
 
-fn parse_number(s: &str) -> Result<u32, ParseIntError> {
-    if s.starts_with('&') || s.starts_with('$') {
-        u32::from_str_radix(s.get(1..s.len()).unwrap_or(""), 16)
-    }
-    else if s.ends_with('h') || s.ends_with('H') {
-        u32::from_str_radix(s.get(0..s.len()-1).unwrap_or(""), 16)
-    } else {
-        u32::from_str_radix(s, 10)
+fn do_cmd(cmd: parser::Cmd, tx: &Sender<DebugCmd>, rx: &Receiver<DebugResp>, in_debugger: &InDebugger) {
+    match cmd {
+        parser::Cmd::Core(debug_cmd) => {
+            tx.send(debug_cmd).unwrap();
+            handle_debug_resp(&rx.recv().unwrap(), in_debugger);
+        }
+        parser::Cmd::UiHelp => print_help(),
+        parser::Cmd::UiExit => std::process::exit(0)
     }
 }
 
-fn handle_cmd(cmd: &str, tx: &Sender<DebugCmd>, rx: &Receiver<DebugResp>, in_debugger: &InDebugger) {
-    let words = cmd.split_whitespace().collect::<Vec<&str>>();
-    let mut iter = words.into_iter();
+fn eval_cmd(text: &str, tx: &Sender<DebugCmd>, rx: &Receiver<DebugResp>, in_debugger: &InDebugger) {
+    let words = text.split_whitespace().collect::<Vec<&str>>();
 
-    let wait_response: bool = match iter.next() {
-        Some(cmd) => {
-            match cmd {
-                "help" => {
-                    print_help();
-                    false
-                }
-                "info" => {
-                    match iter.next() {
-                        Some("breakpoints") => {
-                            tx.send(DebugCmd::ListBreaks).unwrap();
-                            true
-                        }
-                        _ => {
-                            println!("Unknown command: {}", cmd);
-                            false
-                        }
-                    }
-                }
-                "delete" => {
-                    if let Ok(addr) = parse_number(iter.next().unwrap_or("")) {
-                        println!("Deleting breakpoint at &{:x}", addr);
-                        tx.send(DebugCmd::DeleteBreak(addr)).unwrap();
-                        true
-                    } else {
-                        println!("delete expects an address argument");
-                        false
-                    }
-                }
-                "break" => {
-                    if let Ok(addr) = parse_number(iter.next().unwrap_or("")) {
-                        println!("Setting breakpoint at &{:x}", addr);
-                        tx.send(DebugCmd::SetBreak(addr)).unwrap();
-                        true
-                    } else {
-                        println!("break <address>");
-                        false
-                    }
-                }
-                "exit" => std::process::exit(0),
-                "s" | "step" => {
-                    tx.send(DebugCmd::Step).unwrap();
-                    true
-                }
-                "registers" => {
-                    tx.send(DebugCmd::GetRegisters).unwrap();
-                    true
-                }
-                "mem" | "memory" => {
-                    let start_ = parse_number(iter.next().unwrap_or(""));
-                    if let Ok(start) = start_ {
-                        let len = parse_number(iter.next().unwrap_or("")).unwrap_or(16);
-
-                        tx.send(DebugCmd::GetMemory { start, len }).unwrap();
-                        true
-                    } else {
-                        println!("mem <start> [len]");
-                        false
-                    }
-                }
-                "." | "state" => {
-                    tx.send(DebugCmd::GetState).unwrap();
-                    true
-                }
-                mode @ ("dis16" | "dis24" | "dis" | "disassemble") => {
-                    let adl = match mode {
-                        "dis16" => Some(false),
-                        "dis24" => Some(true),
-                        _ => None
-                    };
-                    let start = parse_number(iter.next().unwrap_or(""));
-                    if let Ok(start) = start {
-                        let end = parse_number(iter.next().unwrap_or("")).unwrap_or(start + 0x20);
-                        println!("disassemble {} {}", start, end);
-                        tx.send(DebugCmd::Disassemble { adl, start, end }).unwrap();
-                        true
-                    } else {
-                        tx.send(DebugCmd::DisassemblePc { adl }).unwrap();
-                        true
-                    }
-                }
-                "c" | "continue" => {
-                    println!("Continuing execution... press <CTRL-C> to pause");
-                    in_debugger.store(false, std::sync::atomic::Ordering::SeqCst);
-                    tx.send(DebugCmd::Continue).unwrap();
-                    true
-                }
-                _ => {
-                    println!("Unknown command: {}", cmd);
-                    false
-                }
-            }
-        }
-        None => false
-    };
-
-    // always wait for single response
-    if wait_response {
-        handle_debug_resp(&rx.recv().unwrap(), in_debugger);
+    if let Some(cmd) = parser::parse_cmd(words.into_iter()) {
+        do_cmd(cmd, tx, rx, in_debugger);
+    } else {
+        println!("Unknown or invalid command: {}", text);
     }
 }
 
@@ -193,14 +99,20 @@ fn handle_debug_resp(resp: &DebugResp, in_debugger: &InDebugger) {
                 pos += 16;
             }
         }
-        DebugResp::HitBreakpoint => {
-            println!("CPU paused at breakpoint.");
+        DebugResp::Message(s) => {
+            println!("{}", s);
+        }
+        DebugResp::IsPaused(p) => {
+            in_debugger.store(*p, std::sync::atomic::Ordering::SeqCst);
+        }
+        DebugResp::TriggerRan(msg) => {
+            println!("{}", msg);
             in_debugger.store(true, std::sync::atomic::Ordering::SeqCst);
         }
-        DebugResp::Breakpoints(bs) => {
-            println!("Breakpoints:");
+        DebugResp::Triggers(bs) => {
+            println!("Triggers:");
             for b in bs {
-                println!("\t&{:x}", b.0);
+                println!("\t&{:x}", b.address);
             }
         }
         DebugResp::Pong => {},
@@ -277,7 +189,7 @@ pub fn start(tx: Sender<DebugCmd>, rx: Receiver<DebugResp>) {
                 Ok(line) => {
                     if line != "" {
                         rl.add_history_entry(line.as_str()).unwrap();
-                        handle_cmd(&line, &tx, &rx, &in_debugger);
+                        eval_cmd(&line, &tx, &rx, &in_debugger);
 
                         if in_debugger.load(std::sync::atomic::Ordering::SeqCst) {
                             last_cmd = Some(line);
@@ -285,7 +197,7 @@ pub fn start(tx: Sender<DebugCmd>, rx: Receiver<DebugResp>) {
                             last_cmd = None;
                         }
                     } else if let Some (ref l) = last_cmd {
-                        handle_cmd(l, &tx, &rx, &in_debugger);
+                        eval_cmd(l, &tx, &rx, &in_debugger);
                         //line = rl.history().last();
                     }
                 },
@@ -293,7 +205,7 @@ pub fn start(tx: Sender<DebugCmd>, rx: Receiver<DebugResp>) {
                     break
                 },
                 Err(ReadlineError::Eof) => {
-                    handle_cmd("continue", &tx, &rx, &in_debugger);
+                    do_cmd(parser::Cmd::Core(DebugCmd::Continue), &tx, &rx, &in_debugger);
                     break
                 },
                 Err(err) => {
