@@ -24,9 +24,16 @@ fn print_help() {
     println!("info breakpoints             List breakpoints");
     println!("[mem]ory <start> [len]       Dump memory");
     println!("n[ext]                       Step over function calls");
+    println!("pause                        Pause execution and enter debugger");
     println!("state                        Show CPU state");
     println!(".                            Show CPU state");
     println!("s[tep]                       Execute one instuction");
+    println!("trigger <address> cmd1 : cmd2 : ...");
+    println!("    Perform debugger commands when <address> is reached");
+    println!("    eg: break $123 is equivalent to:");
+    println!("        trigger $123 pause:\"CPU paused at breakpoint\":state");
+    println!();
+    println!("triggers                     List triggers");
     println!();
     println!("The previous command can be repeated by pressing return.");
 }
@@ -38,23 +45,20 @@ fn do_cmd(cmd: parser::Cmd, tx: &Sender<DebugCmd>, rx: &Receiver<DebugResp>, in_
             handle_debug_resp(&rx.recv().unwrap(), in_debugger);
         }
         parser::Cmd::UiHelp => print_help(),
-        parser::Cmd::UiExit => std::process::exit(0)
+        parser::Cmd::UiExit => std::process::exit(0),
+        parser::Cmd::End => {}
     }
 }
 
 fn eval_cmd(text: &str, tx: &Sender<DebugCmd>, rx: &Receiver<DebugResp>, in_debugger: &InDebugger) {
-    let words = text.split_whitespace().collect::<Vec<&str>>();
-
-    if let Some(cmd) = parser::parse_cmd(words.into_iter()) {
-        do_cmd(cmd, tx, rx, in_debugger);
-    } else {
-        println!("Unknown or invalid command: {}", text);
+    match parser::parse_cmd(&mut parser::tokenize(text).into_iter().peekable()) {
+        Ok(cmd) => do_cmd(cmd, tx, rx, in_debugger),
+        Err(msg) => println!("{}", msg)
     }
 }
 
 fn print_registers(reg: &ez80::Registers) {
-    println!("PC:{:06x} AF:{:04x} BC:{:06x} DE:{:06x} HL:{:06x} SPS:{:04x} SPL:{:06x} IX:{:06x} IY:{:06x} MB {:02x} ADL {:01x} MADL {:01x}",
-        reg.pc,
+    println!("AF:{:04x} BC:{:06x} DE:{:06x} HL:{:06x} SPS:{:04x} SPL:{:06x} IX:{:06x} IY:{:06x} MB {:02x} ADL {:01x} MADL {:01x}",
         reg.get16(Reg16::AF),
         reg.get24(Reg16::BC),
         reg.get24(Reg16::DE),
@@ -67,13 +71,6 @@ fn print_registers(reg: &ez80::Registers) {
         reg.adl as i32,
         reg.madl as i32,
     );
-            /*
-            //0bffe9
-            println!(" [{:02x} {:02x} {:02x} {:02x}]", sys.peek(pc),
-                sys.peek(pc.wrapping_add(1)),
-                sys.peek(pc.wrapping_add(2)),
-                sys.peek(pc.wrapping_add(3)));
-                */
 }
 
 fn handle_debug_resp(resp: &DebugResp, in_debugger: &InDebugger) {
@@ -105,21 +102,23 @@ fn handle_debug_resp(resp: &DebugResp, in_debugger: &InDebugger) {
         DebugResp::IsPaused(p) => {
             in_debugger.store(*p, std::sync::atomic::Ordering::SeqCst);
         }
-        DebugResp::TriggerRan(msg) => {
-            println!("{}", msg);
-            in_debugger.store(true, std::sync::atomic::Ordering::SeqCst);
-        }
         DebugResp::Triggers(bs) => {
             println!("Triggers:");
             for b in bs {
-                println!("\t&{:x}", b.address);
+                println!("\t&{:06x} {:?}{}",
+                         b.address,
+                         b.actions,
+                         if b.once { " (once)" } else { "" });
             }
         }
         DebugResp::Pong => {},
-        DebugResp::Disassembly { adl, disasm } => {
+        DebugResp::Disassembly { pc, adl, disasm } => {
             println!("\t.assume adl={}", if *adl {1} else {0});
             for inst in disasm {
-                print!("{:06x}: {:20} |", inst.loc, inst.asm);
+                print!("{} {:06x}: {:20} |",
+                       if inst.loc == *pc { "*" } else { " " },
+                       inst.loc,
+                       inst.asm);
                 for byte in &inst.bytes {
                     print!(" {:02x}", byte);
                 }
@@ -127,12 +126,12 @@ fn handle_debug_resp(resp: &DebugResp, in_debugger: &InDebugger) {
             }
         }
         DebugResp::State { registers, stack, pc_instruction, .. } => {
-            print!("{:20} ", pc_instruction);
+            print!("* {:06x}: {:20} ", registers.pc, pc_instruction);
             print_registers(registers);
             if registers.adl {
-                print!("{:20} SPL top ${:06x}:", "", registers.get24(Reg16::SP));
+                print!("{:30} SPL top ${:06x}:", "", registers.get24(Reg16::SP));
             } else {
-                print!("{:20} SPS top ${:04x}:", "", registers.get16(Reg16::SP));
+                print!("{:30} SPS top ${:04x}:", "", registers.get16(Reg16::SP));
             }
             for byte in stack {
                 print!(" {:02x}", byte);
@@ -140,6 +139,7 @@ fn handle_debug_resp(resp: &DebugResp, in_debugger: &InDebugger) {
             println!();
         }
         DebugResp::Registers(registers) => {
+            print!("PC={:06x} ", registers.pc);
             print_registers(registers);
         }
     }
