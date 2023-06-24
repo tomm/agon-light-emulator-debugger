@@ -1,4 +1,4 @@
-use agon_cpu_emulator::{ DebugCmd, Trigger };
+use agon_cpu_emulator::debugger::{ DebugCmd, Trigger };
 
 #[derive(Debug)]
 pub enum Cmd {
@@ -120,7 +120,7 @@ pub fn parse_cmd(tokens: &mut Tokens) -> Result<Cmd, String> {
                     Err(format!("delete expects an address argument"))
                 }
             }
-            "break" => {
+            "br" | "break" => {
                 if let Some(addr) = parse_number(tokens) {
                     expect_end_of_cmd(tokens)?;
                     Ok(Cmd::Core(DebugCmd::AddTrigger(Trigger {
@@ -147,6 +147,19 @@ pub fn parse_cmd(tokens: &mut Tokens) -> Result<Cmd, String> {
             "s" | "step" => {
                 expect_end_of_cmd(tokens)?;
                 Ok(Cmd::Core(DebugCmd::Step))
+            }
+            "trace" => {
+                if parse_exact(tokens, "on") {
+                    expect_end_of_cmd(tokens)?;
+                    Ok(Cmd::Core(DebugCmd::SetTrace(true)))
+                }
+                else if parse_exact(tokens, "off") {
+                    expect_end_of_cmd(tokens)?;
+                    Ok(Cmd::Core(DebugCmd::SetTrace(false)))
+                }
+                else {
+                    Err(format!("expected 'on' or 'off'"))
+                }
             }
             "registers" => {
                 expect_end_of_cmd(tokens)?;
@@ -197,6 +210,16 @@ pub fn parse_cmd(tokens: &mut Tokens) -> Result<Cmd, String> {
         }
     } else {
         Ok(Cmd::End)
+    }
+}
+
+fn parse_exact(tokens: &mut Tokens, expected: &str) -> bool {
+    match tokens.peek() {
+        Some(&s) if s == expected => {
+            tokens.next();
+            true
+        }
+        _ => false
     }
 }
 

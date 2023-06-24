@@ -1,11 +1,10 @@
 use std::sync::mpsc::{Sender, Receiver};
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
-use ez80::*;
 
 mod parser;
 
-use agon_cpu_emulator::{ DebugResp, DebugCmd };
+use agon_cpu_emulator::debugger::{ DebugResp, DebugCmd, Registers, Reg16 };
 
 type InDebugger = std::sync::Arc<std::sync::atomic::AtomicBool>;
 
@@ -14,7 +13,7 @@ fn print_help() {
     println!("<CTRL-C>                     Pause Agon CPU and enter debugger");
     println!();
     println!("While CPU is paused:");
-    println!("break <address>              Set a breakpoint at the hex address");
+    println!("br[eak] <address>            Set a breakpoint at the hex address");
     println!("c[ontinue]                   Resume (un-pause) Agon CPU");
     println!("delete <address>             Delete a breakpoint");
     println!("dis[assemble] [start] [end]  Disassemble in current ADL mode");
@@ -28,6 +27,8 @@ fn print_help() {
     println!("state                        Show CPU state");
     println!(".                            Show CPU state");
     println!("s[tep]                       Execute one instuction");
+    println!("trace on                     Enable logging every instruction");
+    println!("trace off                    Disable logging every instruction");
     println!("trigger <address> cmd1 : cmd2 : ...");
     println!("    Perform debugger commands when <address> is reached");
     println!("    eg: break $123 is equivalent to:");
@@ -57,8 +58,8 @@ fn eval_cmd(text: &str, tx: &Sender<DebugCmd>, rx: &Receiver<DebugResp>, in_debu
     }
 }
 
-fn print_registers(reg: &ez80::Registers) {
-    println!("AF:{:04x} BC:{:06x} DE:{:06x} HL:{:06x} SPS:{:04x} SPL:{:06x} IX:{:06x} IY:{:06x} MB {:02x} ADL {:01x} MADL {:01x}",
+fn print_registers(reg: &Registers) {
+    println!("AF:{:04x} BC:{:06x} DE:{:06x} HL:{:06x} SPS:{:04x} SPL:{:06x} IX:{:06x} IY:{:06x} MB {:02x} ADL:{:01x} MADL:{:01x} IFF1:{}",
         reg.get16(Reg16::AF),
         reg.get24(Reg16::BC),
         reg.get24(Reg16::DE),
@@ -70,6 +71,7 @@ fn print_registers(reg: &ez80::Registers) {
         reg.mbase,
         reg.adl as i32,
         reg.madl as i32,
+        if reg.get_iff1() { '1' } else { '0' },
     );
 }
 
