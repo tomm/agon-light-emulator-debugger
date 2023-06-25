@@ -7,6 +7,6 @@ edition = "2021"
 
 [dependencies]
 ctrlc = "3.4.0"
-agon-cpu-emulator = { git = "https://github.com/tomm/agon-cpu-emulator.git", rev="4731c83423bda69587a3968d90ed2a03dc4ae82f"}
+agon-cpu-emulator = { git = "https://github.com/tomm/agon-cpu-emulator.git", rev="b77b5d5dd219305fecba450f780b5fff7f61a338"}
 #agon-cpu-emulator = { path = "../agon-cpu-emulator" }
 rustyline = "11.0.0"
