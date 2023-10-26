@@ -6,7 +6,30 @@ mod parser;
 
 use agon_cpu_emulator::debugger::{ DebugResp, DebugCmd, Registers, Reg16 };
 
-type InDebugger = std::sync::Arc<std::sync::atomic::AtomicBool>;
+#[derive(Clone)]
+struct EmuState {
+    pub in_debugger: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pub emulator_shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl EmuState {
+    pub fn is_in_debugger(&self) -> bool {
+        self.in_debugger.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub fn set_in_debugger(&self, state: bool) {
+        self.in_debugger.store(state, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn is_emulator_shutdown(&self) -> bool {
+        self.emulator_shutdown.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub fn shutdown(&self) {
+        self.emulator_shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.set_in_debugger(false);
+    }
+}
 
 fn print_help() {
     println!("While CPU is running:");
@@ -39,21 +62,21 @@ fn print_help() {
     println!("The previous command can be repeated by pressing return.");
 }
 
-fn do_cmd(cmd: parser::Cmd, tx: &Sender<DebugCmd>, rx: &Receiver<DebugResp>, in_debugger: &InDebugger) {
+fn do_cmd(cmd: parser::Cmd, tx: &Sender<DebugCmd>, rx: &Receiver<DebugResp>, state: &EmuState) {
     match cmd {
         parser::Cmd::Core(debug_cmd) => {
             tx.send(debug_cmd).unwrap();
-            handle_debug_resp(&rx.recv().unwrap(), in_debugger);
+            handle_debug_resp(&rx.recv().unwrap(), state);
         }
         parser::Cmd::UiHelp => print_help(),
-        parser::Cmd::UiExit => std::process::exit(0),
+        parser::Cmd::UiExit => state.shutdown(),
         parser::Cmd::End => {}
     }
 }
 
-fn eval_cmd(text: &str, tx: &Sender<DebugCmd>, rx: &Receiver<DebugResp>, in_debugger: &InDebugger) {
+fn eval_cmd(text: &str, tx: &Sender<DebugCmd>, rx: &Receiver<DebugResp>, state: &EmuState) {
     match parser::parse_cmd(&mut parser::tokenize(text).into_iter().peekable()) {
-        Ok(cmd) => do_cmd(cmd, tx, rx, in_debugger),
+        Ok(cmd) => do_cmd(cmd, tx, rx, state),
         Err(msg) => println!("{}", msg)
     }
 }
@@ -75,7 +98,7 @@ fn print_registers(reg: &Registers) {
     );
 }
 
-fn handle_debug_resp(resp: &DebugResp, in_debugger: &InDebugger) {
+fn handle_debug_resp(resp: &DebugResp, state: &EmuState) {
     match resp {
         DebugResp::Memory { start, data } => {
             let mut pos = *start;
@@ -102,7 +125,7 @@ fn handle_debug_resp(resp: &DebugResp, in_debugger: &InDebugger) {
             println!("{}", s);
         }
         DebugResp::IsPaused(p) => {
-            in_debugger.store(*p, std::sync::atomic::Ordering::SeqCst);
+            state.set_in_debugger(*p);
         }
         DebugResp::Triggers(bs) => {
             println!("Triggers:");
@@ -147,10 +170,10 @@ fn handle_debug_resp(resp: &DebugResp, in_debugger: &InDebugger) {
     }
 }
 
-fn drain_rx(rx: &Receiver<DebugResp>, in_debugger: &InDebugger) {
+fn drain_rx(rx: &Receiver<DebugResp>, state: &EmuState) {
     loop {
         if let Ok(resp) = rx.try_recv() {
-            handle_debug_resp(&resp, in_debugger);
+            handle_debug_resp(&resp, state);
         } else {
             break;
         }
@@ -159,9 +182,15 @@ fn drain_rx(rx: &Receiver<DebugResp>, in_debugger: &InDebugger) {
 
 const PAUSE_AT_START: bool = true;
 
-pub fn start(tx: Sender<DebugCmd>, rx: Receiver<DebugResp>) {
-    let in_debugger = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(PAUSE_AT_START));
-    let in_debugger_ = in_debugger.clone();
+pub fn start(
+    tx: Sender<DebugCmd>,
+    rx: Receiver<DebugResp>,
+    emulator_shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>
+) {
+    let state = EmuState {
+        in_debugger: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(PAUSE_AT_START)),
+        emulator_shutdown
+    };
     let tx_from_ctrlc = tx.clone();
 
     // should be able to get this from rl.history(), but couldn't figure out the API...
@@ -174,32 +203,35 @@ pub fn start(tx: Sender<DebugCmd>, rx: Receiver<DebugResp>) {
         println!("Interrupting execution.");
     }
 
-    ctrlc::set_handler(move || {
-        in_debugger_.store(true, std::sync::atomic::Ordering::SeqCst);
-        println!("Interrupting execution.");
-        tx_from_ctrlc.send(DebugCmd::Pause).unwrap();
-        tx_from_ctrlc.send(DebugCmd::GetState).unwrap();
-    }).expect("Error setting Ctrl-C handler");
+    {
+        let _state = state.clone();
+        ctrlc::set_handler(move || {
+            _state.set_in_debugger(true);
+            println!("Interrupting execution.");
+            tx_from_ctrlc.send(DebugCmd::Pause).unwrap();
+            tx_from_ctrlc.send(DebugCmd::GetState).unwrap();
+        }).expect("Error setting Ctrl-C handler");
+    }
 
     // `()` can be used when no completer is required
     let mut rl = DefaultEditor::new().unwrap();
-    loop {
-        while in_debugger.load(std::sync::atomic::Ordering::SeqCst) {
-            drain_rx(&rx, &in_debugger);
+    while !state.is_emulator_shutdown() {
+        while state.is_in_debugger() {
+            drain_rx(&rx, &state);
             let readline = rl.readline(">> ");
             match readline {
                 Ok(line) => {
                     if line != "" {
                         rl.add_history_entry(line.as_str()).unwrap();
-                        eval_cmd(&line, &tx, &rx, &in_debugger);
+                        eval_cmd(&line, &tx, &rx, &state);
 
-                        if in_debugger.load(std::sync::atomic::Ordering::SeqCst) {
+                        if state.is_in_debugger() {
                             last_cmd = Some(line);
                         } else {
                             last_cmd = None;
                         }
                     } else if let Some (ref l) = last_cmd {
-                        eval_cmd(l, &tx, &rx, &in_debugger);
+                        eval_cmd(l, &tx, &rx, &state);
                         //line = rl.history().last();
                     }
                 },
@@ -207,7 +239,7 @@ pub fn start(tx: Sender<DebugCmd>, rx: Receiver<DebugResp>) {
                     break
                 },
                 Err(ReadlineError::Eof) => {
-                    do_cmd(parser::Cmd::Core(DebugCmd::Continue), &tx, &rx, &in_debugger);
+                    do_cmd(parser::Cmd::Core(DebugCmd::Continue), &tx, &rx, &state);
                     break
                 },
                 Err(err) => {
@@ -219,7 +251,7 @@ pub fn start(tx: Sender<DebugCmd>, rx: Receiver<DebugResp>) {
 
         // when not reading debugger commands, periodically handle messages
         // from the CPU
-        drain_rx(&rx, &in_debugger);
+        drain_rx(&rx, &state);
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
 }
